@@ -1,18 +1,19 @@
 """
 data/database.py
 ----------------
-SQLAlchemy ORM layer — the only place in the codebase that touches the DB.
+SQLAlchemy ORM layer for company profiles — the only place that touches the DB.
 
 Design decisions:
-  • url is the PRIMARY KEY — safe to run pipeline multiple times (upsert)
-  • pool_pre_ping=True — avoids stale connections on Railway
-  • All public functions return plain dicts/DataFrames, not ORM objects —
-    keeps the rest of the codebase free of SQLAlchemy imports
+  • website_url is the PRIMARY KEY — safe to enrich the same company multiple times
+  • mail stored as JSON string (SQLite has no native array type)
+  • pool_pre_ping=True — avoids stale connections on Render
+  • All public functions return plain dicts, not ORM objects
 """
 
+import json
 from datetime import datetime
-from typing import Any
-import pandas as pd
+from typing import Any, Optional
+
 from sqlalchemy import (
     create_engine, Column, String, Float, Integer, DateTime, Text, inspect
 )
@@ -28,25 +29,25 @@ class Base(DeclarativeBase):
     pass
 
 
-class BookRecord(Base):
-    __tablename__ = "books"
+class CompanyRecord(Base):
+    __tablename__ = "companies"
 
     # Identity
-    url          = Column(String,  primary_key=True)
-    title        = Column(String,  nullable=False, index=True)
+    website_url    = Column(String,  primary_key=True)
 
-    # Scraped fields
-    price        = Column(Float,   nullable=False)
-    rating       = Column(Integer, nullable=False)
-    availability = Column(String,  nullable=False)
-    scraped_at   = Column(DateTime, default=datetime.utcnow)
+    # Core fields (match hackathon schema)
+    website_name         = Column(String,  nullable=False, default="N/A")
+    company_name         = Column(String,  nullable=False, default="N/A")
+    address              = Column(String,  default="N/A")
+    mobile_number        = Column(String,  default="N/A")
+    mail                 = Column(Text,    default="[]")  # JSON array string
+    core_service         = Column(Text,    default="N/A")
+    target_customer      = Column(Text,    default="N/A")
+    probable_pain_point  = Column(Text,    default="N/A")
+    outreach_opener      = Column(Text,    default="N/A")
 
-    # AI-enriched fields (nullable — may not be enriched yet)
-    genre        = Column(String, default="Unknown")
-    summary      = Column(Text,   default="")
-    sentiment    = Column(String, default="Neutral")
-    value_score  = Column(Float,  default=0.0)
-    enriched_at  = Column(DateTime, nullable=True)
+    # Metadata
+    enriched_at = Column(DateTime, default=datetime.utcnow)
 
 
 # ── Engine (module-level singleton) ───────────────────────────────────────────
@@ -60,7 +61,7 @@ def get_engine():
         _engine = create_engine(
             settings.DB_URL,
             echo=False,
-            pool_pre_ping=True,   # keeps connections alive on cloud hosts
+            pool_pre_ping=True,
             connect_args={"check_same_thread": False},  # needed for SQLite
         )
     return _engine
@@ -70,68 +71,89 @@ def get_engine():
 
 def init_db() -> None:
     """Create all tables if they don't exist. Idempotent."""
+    settings.bootstrap()
     Base.metadata.create_all(get_engine())
     logger.info("[db] Schema initialised")
 
 
-def upsert_books(records: list[dict[str, Any]]) -> dict[str, int]:
+def upsert_company(profile_dict: dict) -> dict[str, str]:
     """
-    Insert new books or update existing ones (keyed on url).
-    Returns {"inserted": N, "updated": M} for logging.
+    Insert or update a company profile.
+    The 'mail' field is converted from list to JSON string for storage.
+    Returns {"action": "inserted"} or {"action": "updated"}.
     """
-    if not records:
-        logger.warning("[db] upsert called with empty list — nothing to do")
-        return {"inserted": 0, "updated": 0}
+    # Convert mail list to JSON string for SQLite storage
+    data = dict(profile_dict)
+    if isinstance(data.get("mail"), list):
+        data["mail"] = json.dumps(data["mail"])
 
-    # Resolve valid column names once — guards against extra Pydantic fields
-    valid_cols = {c.name for c in BookRecord.__table__.columns}
-    inserted = updated = 0
+    # Only keep columns that exist in the table
+    valid_cols = {c.name for c in CompanyRecord.__table__.columns}
+    clean = {k: v for k, v in data.items() if k in valid_cols}
+
+    if "enriched_at" not in clean or clean["enriched_at"] is None:
+        clean["enriched_at"] = datetime.utcnow()
 
     with Session(get_engine()) as session:
-        for rec in records:
-            clean = {k: v for k, v in rec.items() if k in valid_cols}
-            existing = session.get(BookRecord, clean["url"])
-            if existing:
-                for k, v in clean.items():
-                    setattr(existing, k, v)
-                updated += 1
-            else:
-                session.add(BookRecord(**clean))
-                inserted += 1
+        existing = session.get(CompanyRecord, clean["website_url"])
+        if existing:
+            for k, v in clean.items():
+                setattr(existing, k, v)
+            action = "updated"
+        else:
+            session.add(CompanyRecord(**clean))
+            action = "inserted"
         session.commit()
 
-    logger.info(f"[db] Upsert complete — inserted={inserted}, updated={updated}")
-    return {"inserted": inserted, "updated": updated}
+    logger.info(f"[db] {action} company: {clean.get('website_url', 'unknown')}")
+    return {"action": action}
 
 
-def load_all_books() -> pd.DataFrame:
+def load_all_companies() -> list[dict[str, Any]]:
     """
-    Load every book as a DataFrame.
-    Returns empty DataFrame (not None) when table is empty — safe for callers.
+    Load all company profiles as a list of dicts.
+    Converts mail JSON string back to list.
+    Returns empty list (not None) when table is empty.
     """
     with Session(get_engine()) as session:
-        rows = session.query(BookRecord).order_by(BookRecord.scraped_at.desc()).all()
+        rows = session.query(CompanyRecord).order_by(
+            CompanyRecord.enriched_at.desc()
+        ).all()
 
     if not rows:
-        return pd.DataFrame()
+        return []
 
-    return pd.DataFrame(
-        [{c.name: getattr(row, c.name) for c in BookRecord.__table__.columns}
-         for row in rows]
-    )
+    results = []
+    for row in rows:
+        d = {c.name: getattr(row, c.name) for c in CompanyRecord.__table__.columns}
+        # Convert mail JSON string back to list
+        try:
+            d["mail"] = json.loads(d["mail"]) if d["mail"] else []
+        except (json.JSONDecodeError, TypeError):
+            d["mail"] = []
+        # Convert datetime to ISO string for JSON serialization
+        if d.get("enriched_at"):
+            d["enriched_at"] = d["enriched_at"].isoformat()
+        results.append(d)
+
+    return results
 
 
-def get_stats() -> dict[str, Any]:
-    """Quick aggregate stats — used by dashboard KPI row."""
-    df = load_all_books()
-    if df.empty:
-        return {}
+def get_company_by_url(url: str) -> Optional[dict[str, Any]]:
+    """Look up a single company by URL. Returns None if not found."""
+    url = url.strip().rstrip("/")
 
-    return {
-        "total":          len(df),
-        "avg_price":      round(df["price"].mean(), 2),
-        "avg_rating":     round(df["rating"].mean(), 2),
-        "top_genre":      df["genre"].mode()[0] if "genre" in df.columns else "N/A",
-        "enriched_count": int(df["enriched_at"].notna().sum()),
-        "last_scraped":   df["scraped_at"].max(),
-    }
+    with Session(get_engine()) as session:
+        row = session.get(CompanyRecord, url)
+
+    if not row:
+        return None
+
+    d = {c.name: getattr(row, c.name) for c in CompanyRecord.__table__.columns}
+    try:
+        d["mail"] = json.loads(d["mail"]) if d["mail"] else []
+    except (json.JSONDecodeError, TypeError):
+        d["mail"] = []
+    if d.get("enriched_at"):
+        d["enriched_at"] = d["enriched_at"].isoformat()
+    return d

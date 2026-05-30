@@ -1,25 +1,20 @@
 """
 ai/enricher.py
 --------------
-Gemini-powered batch enrichment for book records.
-
-Why batch (5 books per call)?
-  Gemini free tier = 15 RPM.
-  100 books × 1 call each = 100 calls → needs 6+ minutes.
-  100 books ÷ 5 per batch = 20 calls  → needs ~90 seconds. ✓
+Groq-powered company intelligence enrichment.
 
 Key production practices:
-  • Single Gemini client reused across all calls (no re-init overhead)
-  • Strict JSON prompt with explicit schema — no markdown fences allowed
-  • Per-call retry with exponential backoff (tenacity)
-  • Fallback enrichment when Gemini fails — never crashes the pipeline
-  • Pydantic validation on AI output — catches hallucinated field values
-  • Gemini RPM-aware delay between batches
+  • Anti-hallucination: scraped emails/phones passed as ground truth — AI told to
+    use ONLY those, never fabricate. If not found, return "N/A".
+  • Structured JSON output: response_format=json_object forces valid JSON
+  • Retry with exponential backoff (tenacity)
+  • Fallback enrichment when AI fails — never crashes the pipeline
+  • Token optimization: cleaned text only, max ~20K chars total
+  • Single Groq client reused across all calls
+  • Temperature 0.1 for deterministic, factual output
 """
 
 import json
-import time
-from datetime import datetime
 from typing import Optional
 
 from groq import Groq
@@ -32,55 +27,55 @@ from tenacity import (
 )
 
 from config import settings
-from data.models import RawBook, EnrichedBook
 
 
-# ── Prompt ────────────────────────────────────────────────────────────────────
+# ── Prompt Engineering ────────────────────────────────────────────────────────
 
-GENRES = [
-    "Fiction", "Mystery & Thriller", "Romance", "Science Fiction",
-    "Fantasy", "Biography", "Self-Help", "History", "Children's",
-    "Business", "Travel", "Food & Cooking", "Health", "Science",
-    "Philosophy", "Sports", "Other",
-]
+SYSTEM_PROMPT = """You are a business intelligence analyst. Your job is to extract structured company information from website content.
 
-# One-shot prompt: send N books → get back a JSON array of N objects
-BATCH_PROMPT_TEMPLATE = """You are a book metadata enrichment engine for an e-commerce platform.
-Given a list of books (title, price in GBP, star rating), return ONLY a valid JSON array.
-No preamble. No explanation. No markdown code fences. Raw JSON only.
+CRITICAL RULES — READ CAREFULLY:
+1. ONLY extract information that is EXPLICITLY STATED or STRONGLY IMPLIED in the provided website text.
+2. If a piece of information is NOT found in the text, you MUST return "N/A" for that field. NEVER FABRICATE OR GUESS.
+3. For emails and phone numbers: I will provide you with emails and phones that were found on the website via regex extraction. Use ONLY those. Do NOT invent any contact details.
+4. The "core_service" should be a concise summary of what the company actually does, based on the content.
+5. The "target_customer" should be inferred from case studies, testimonials, or service descriptions on the site.
+6. The "probable_pain_point" should be inferred from the problems the company claims to solve for its customers.
+7. The "outreach_opener" must reference SPECIFIC details from the website content — never use generic templates.
 
-Each element must match this schema exactly:
+You must respond with ONLY a valid JSON object. No explanation. No markdown. No code fences. Raw JSON only."""
+
+USER_PROMPT_TEMPLATE = """Analyze this company website and extract a business profile.
+
+COMPANY URL: {url}
+WEBSITE NAME (provided by user): {website_name}
+
+CONTACT INFORMATION FOUND ON WEBSITE (use these EXACTLY, do not modify or invent):
+- Emails found: {emails}
+- Phone numbers found: {phones}
+
+WEBSITE CONTENT (from {page_count} pages):
+{content}
+
+Return a JSON object with exactly these fields:
 {{
-  "genre":       "<one of: {genres}>",
-  "summary":     "<2-sentence editorial description of what this book is likely about>",
-  "sentiment":   "<one of: Positive, Neutral, Negative — based on overall title tone>",
-  "value_score": <float 0.0–10.0, where 10 = best value (high rating + low price)>
-}}
-
-Books to enrich:
-{book_list}
-
-Return a JSON array with exactly {count} elements, in the same order as the input list."""
-
-
-def _build_prompt(batch: list[RawBook]) -> str:
-    book_lines = "\n".join(
-        f'{i+1}. "{b.title}" | £{b.price:.2f} | {b.rating}/5 stars | {b.availability}'
-        for i, b in enumerate(batch)
-    )
-    return BATCH_PROMPT_TEMPLATE.format(
-        genres=", ".join(GENRES),
-        book_list=book_lines,
-        count=len(batch),
-    )
+  "website_name": "The website/brand name as it appears on the site (use the provided name if you can't find one)",
+  "company_name": "The full legal/official company name if found, otherwise use website name",
+  "address": "Full physical address if found on the site, otherwise N/A",
+  "mobile_number": "Primary phone number from the FOUND list above, otherwise N/A",
+  "mail": ["array", "of", "emails", "from the FOUND list above"],
+  "core_service": "What the company does - be specific, based on actual website content",
+  "target_customer": "Who their customers are - infer from site content, case studies, testimonials",
+  "probable_pain_point": "What problems their customers likely face that this company solves",
+  "outreach_opener": "A personalized, specific outreach message referencing details from THIS company's website"
+}}"""
 
 
-# ── Gemini client ─────────────────────────────────────────────────────────────
+# ── Groq Client ──────────────────────────────────────────────────────────────
 
 _client: Optional[Groq] = None
 
 
-def _get_model() -> Groq:
+def _get_client() -> Groq:
     """Lazy-init: create Groq client once and reuse."""
     global _client
     if _client is None:
@@ -93,27 +88,33 @@ def _get_model() -> Groq:
     return _client
 
 
-# ── API call with retry ────────────────────────────────────────────────────────
+# ── API Call with Retry ───────────────────────────────────────────────────────
 
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=4, max=30),
     retry=retry_if_exception_type(Exception),
     before_sleep=lambda s: logger.warning(
-        f"[ai] Retrying _call_groq (attempt {s.attempt_number}) — "
+        f"[ai] Retrying (attempt {s.attempt_number}) — "
         f"{type(s.outcome.exception()).__name__}: {str(s.outcome.exception())[:120]}"
     ),
-    reraise=False,
+    reraise=True,
 )
-def _call_gemini(prompt: str) -> Optional[list[dict]]:
-    """Send prompt → receive JSON array via Groq."""
-    client   = _get_model()
+def _call_groq(system_prompt: str, user_prompt: str) -> dict:
+    """
+    Send prompt to Groq → receive structured JSON.
+    Uses json_object response format for guaranteed valid JSON.
+    """
+    client = _get_client()
     response = client.chat.completions.create(
         model=settings.GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=8192,
-        response_format={"type": "json_object"},  # forces JSON output
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=settings.AI_TEMPERATURE,
+        max_tokens=settings.AI_MAX_TOKENS,
+        response_format={"type": "json_object"},
     )
     raw = response.choices[0].message.content.strip()
 
@@ -121,134 +122,290 @@ def _call_gemini(prompt: str) -> Optional[list[dict]]:
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
-    # Groq returns a JSON object, not array — unwrap if needed
     parsed = json.loads(raw)
-    if isinstance(parsed, dict):
-        # Model may wrap array under a key like {"books": [...]}
-        for v in parsed.values():
-            if isinstance(v, list):
-                return v
-        raise ValueError(f"JSON object has no list value: {list(parsed.keys())}")
 
-    if not isinstance(parsed, list):
-        raise ValueError(f"Expected JSON array, got {type(parsed).__name__}")
+    # Log token usage for optimization tracking
+    usage = response.usage
+    if usage:
+        logger.info(
+            f"[ai] Tokens — prompt: {usage.prompt_tokens}, "
+            f"completion: {usage.completion_tokens}, "
+            f"total: {usage.total_tokens}"
+        )
+
     return parsed
 
 
-# ── Fallback ───────────────────────────────────────────────────────────────────
+# ── Batch Processing ──────────────────────────────────────────────────────────
 
-def _rule_based_enrichment(book: RawBook) -> dict:
-    """
-    Deterministic fallback when AI is unavailable.
-    Value score = 60% rating weight + 40% cheapness weight, scaled to 0–10.
-    """
-    cheapness    = max(0.0, 1.0 - book.price / 60.0)
-    value_score  = round((book.rating / 5.0) * 6.0 + cheapness * 4.0, 2)
-    return {
-        "genre":       "Other",
-        "summary":     (
-            f'"{book.title}" is priced at £{book.price:.2f} '
-            f"and holds a {book.rating}/5 star rating."
-        ),
-        "sentiment":   "Neutral",
-        "value_score": value_score,
-    }
+BATCH_SYSTEM_PROMPT = """You are a business intelligence analyst. Extract structured company information from website content for MULTIPLE companies.
+
+CRITICAL RULES:
+1. ONLY use information EXPLICITLY STATED in the provided text. If not found, return "N/A".
+2. For contact details: use ONLY the emails/phones provided. NEVER fabricate.
+3. Respond with ONLY a valid JSON object containing a "companies" key with an array of profiles.
+4. Each profile must have exactly these fields: website_name, company_name, address, mobile_number, mail, core_service, target_customer, probable_pain_point, outreach_opener.
+5. Return the profiles in the SAME ORDER as the input companies."""
+
+BATCH_USER_TEMPLATE = """Analyze these {count} company websites and extract business profiles for each.
+
+{companies_block}
+
+Return a JSON object with exactly this structure:
+{{
+  "companies": [
+    {{
+      "website_name": "...",
+      "company_name": "...",
+      "address": "... or N/A",
+      "mobile_number": "... or N/A",
+      "mail": ["array of emails found"],
+      "core_service": "...",
+      "target_customer": "...",
+      "probable_pain_point": "...",
+      "outreach_opener": "..."
+    }}
+  ]
+}}
+
+Return exactly {count} company profiles in the companies array, in the same order as input."""
 
 
-# ── Batch enrichment ───────────────────────────────────────────────────────────
+def _build_company_block(scraped: dict, website_name: str, index: int) -> str:
+    """Build a text block for one company's scraped data."""
+    url = scraped.get("url", "unknown")
+    emails = scraped.get("raw_emails", [])
+    phones = scraped.get("raw_phones", [])
+    pages = scraped.get("pages", {})
 
-def _enrich_batch(batch: list[RawBook]) -> list[dict]:
-    """
-    Enrich one batch via Gemini.
-    If batch call returns wrong count (due to truncation repair),
-    falls back to one-book-at-a-time calls before using rule-based.
-    Always returns exactly len(batch) dicts.
-    """
-    prompt = _build_prompt(batch)
-    result = _call_gemini(prompt)
+    # Combine all page content with labels
+    content_parts = []
+    for page_name, text in pages.items():
+        if text.strip():
+            content_parts.append(f"[{page_name.upper()}]:\n{text}")
 
-    # Happy path — got exactly what we asked for
-    if result and len(result) == len(batch):
-        return result
+    content = "\n\n".join(content_parts) if content_parts else "No content could be extracted."
 
-    # Partial result from truncation repair — fill gaps with individual calls
-    if result and 0 < len(result) < len(batch):
-        logger.warning(
-            f"[ai] Batch returned {len(result)}/{len(batch)} items — "
-            "filling missing books with individual calls"
-        )
-        for i in range(len(result), len(batch)):
-            single = _call_gemini(_build_prompt([batch[i]]))
-            result.append(single[0] if single else _rule_based_enrichment(batch[i]))
-        return result
+    # Truncate total content to avoid hitting context limits
+    if len(content) > 6000:
+        content = content[:6000] + "\n... (content truncated for token efficiency)"
 
-    # Total failure — fall back to rule-based for entire batch
-    logger.warning(f"[ai] Batch call failed entirely — using rule-based fallback")
-    return [_rule_based_enrichment(b) for b in batch]
+    return f"""--- COMPANY {index} ---
+URL: {url}
+WEBSITE NAME (user-provided): {website_name}
+EMAILS FOUND ON SITE: {json.dumps(emails) if emails else 'None found'}
+PHONES FOUND ON SITE: {json.dumps(phones) if phones else 'None found'}
+
+WEBSITE CONTENT ({len(pages)} pages scraped):
+{content}
+--- END COMPANY {index} ---"""
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def enrich_books(raw_books: list[RawBook]) -> list[EnrichedBook]:
+def enrich_company(scraped_data: dict, website_name: str = "N/A") -> dict:
     """
-    Enrich all books in batches of AI_BATCH_SIZE.
-    Never raises — any failure for a batch falls back to rule-based enrichment.
-    Returns a list of EnrichedBook objects in the same order as input.
+    Enrich a single company using Groq AI.
+
+    Args:
+        scraped_data: Output from scraper.scrape_company()
+        website_name: User-provided website name for record-keeping
+
+    Returns:
+        Dict matching the hackathon JSON schema. Never raises — falls back
+        to a safe dict with "N/A" values on any failure.
     """
-    if not raw_books:
-        return []
+    url = scraped_data.get("url", "unknown")
 
-    batch_size  = settings.AI_BATCH_SIZE
-    enriched:  list[EnrichedBook] = []
-    total       = len(raw_books)
-    n_batches   = (total + batch_size - 1) // batch_size
+    if not scraped_data.get("success") or not scraped_data.get("pages"):
+        logger.warning(f"[ai] No scraped content for {url} — returning defaults")
+        return _fallback_profile(url, website_name, scraped_data)
 
-    logger.info(
-        f"[ai] Enriching {total} books in {n_batches} batches of {batch_size}"
+    # Build prompt
+    pages = scraped_data["pages"]
+    emails = scraped_data.get("raw_emails", [])
+    phones = scraped_data.get("raw_phones", [])
+
+    content_parts = []
+    for page_name, text in pages.items():
+        if text.strip():
+            content_parts.append(f"[{page_name.upper()}]:\n{text}")
+    content = "\n\n".join(content_parts)
+
+    # Token optimization: limit total content
+    if len(content) > 8000:
+        content = content[:8000] + "\n... (content truncated for token efficiency)"
+
+    user_prompt = USER_PROMPT_TEMPLATE.format(
+        url=url,
+        website_name=website_name,
+        emails=json.dumps(emails) if emails else "None found on the website",
+        phones=json.dumps(phones) if phones else "None found on the website",
+        page_count=len(pages),
+        content=content,
     )
 
-    for batch_idx in range(n_batches):
-        start = batch_idx * batch_size
-        end   = min(start + batch_size, total)
-        batch = raw_books[start:end]
+    try:
+        result = _call_groq(SYSTEM_PROMPT, user_prompt)
+        # Ensure all required fields exist with safe defaults
+        return _validate_result(result, url, website_name, scraped_data)
+    except Exception as exc:
+        logger.error(f"[ai] Enrichment failed for {url}: {exc}")
+        return _fallback_profile(url, website_name, scraped_data)
 
-        logger.info(
-            f"[ai] Batch {batch_idx + 1}/{n_batches} "
-            f"(books {start + 1}–{end})"
+
+def enrich_companies_batch(
+    scraped_list: list[dict],
+    website_names: list[str],
+) -> list[dict]:
+    """
+    Batch-enrich multiple companies in a single Groq call.
+    Falls back to individual calls if batch fails.
+
+    This is more token-efficient for the Colab notebook where we process
+    multiple URLs at once. For the web API, use enrich_company() individually.
+
+    Args:
+        scraped_list: List of scraper outputs
+        website_names: Corresponding website names
+
+    Returns:
+        List of dicts matching hackathon schema, in same order as input.
+    """
+    if len(scraped_list) == 1:
+        return [enrich_company(scraped_list[0], website_names[0])]
+
+    # For larger batches (>3), process in sub-batches to stay within context limits
+    if len(scraped_list) > 3:
+        results = []
+        for i in range(0, len(scraped_list), 3):
+            batch = scraped_list[i:i+3]
+            names = website_names[i:i+3]
+            results.extend(enrich_companies_batch(batch, names))
+        return results
+
+    # Build batch prompt
+    companies_block = "\n\n".join(
+        _build_company_block(sd, wn, i+1)
+        for i, (sd, wn) in enumerate(zip(scraped_list, website_names))
+    )
+
+    user_prompt = BATCH_USER_TEMPLATE.format(
+        count=len(scraped_list),
+        companies_block=companies_block,
+    )
+
+    try:
+        result = _call_groq(BATCH_SYSTEM_PROMPT, user_prompt)
+
+        # Extract companies array
+        companies = None
+        if isinstance(result, dict):
+            companies = result.get("companies") or result.get("results")
+            if not companies:
+                # Try to find any list value
+                for v in result.values():
+                    if isinstance(v, list):
+                        companies = v
+                        break
+
+        if companies and len(companies) == len(scraped_list):
+            return [
+                _validate_result(c, sd["url"], wn, sd)
+                for c, sd, wn in zip(companies, scraped_list, website_names)
+            ]
+
+        # Wrong count — fall back to individual calls
+        logger.warning(
+            f"[ai] Batch returned {len(companies) if companies else 0}/"
+            f"{len(scraped_list)} — falling back to individual calls"
         )
+    except Exception as exc:
+        logger.error(f"[ai] Batch enrichment failed: {exc}")
 
-        ai_results = _enrich_batch(batch)
+    # Fallback: individual calls
+    return [
+        enrich_company(sd, wn)
+        for sd, wn in zip(scraped_list, website_names)
+    ]
 
-        for book, ai_data in zip(batch, ai_results):
-            try:
-                enriched.append(
-                    EnrichedBook(
-                        **book.model_dump(),
-                        genre=str(ai_data.get("genre",      "Other")),
-                        summary=str(ai_data.get("summary",    "")),
-                        sentiment=str(ai_data.get("sentiment",  "Neutral")),
-                        value_score=float(ai_data.get("value_score", 0.0)),
-                        enriched_at=datetime.utcnow(),
-                    )
-                )
-            except Exception as exc:
-                logger.warning(
-                    f"[ai] Validation failed for '{book.title}': {exc} — "
-                    "using fallback"
-                )
-                fb = _rule_based_enrichment(book)
-                enriched.append(
-                    EnrichedBook(
-                        **book.model_dump(),
-                        **fb,
-                        enriched_at=datetime.utcnow(),
-                    )
-                )
 
-        # Respect Gemini free-tier rate limit (skip delay after last batch)
-        if batch_idx < n_batches - 1:
-            logger.debug(f"[ai] Sleeping {settings.AI_BATCH_DELAY}s (rate limit)")
-            time.sleep(settings.AI_BATCH_DELAY)
+# ── Validation & Fallback ────────────────────────────────────────────────────
 
-    logger.success(f"[ai] Enrichment complete — {len(enriched)}/{total} books enriched")
-    return enriched
+def _validate_result(
+    ai_result: dict,
+    url: str,
+    website_name: str,
+    scraped_data: dict,
+) -> dict:
+    """
+    Ensure AI output has all required fields with safe defaults.
+    Merges regex-extracted contacts if AI missed them.
+    """
+    emails = scraped_data.get("raw_emails", [])
+    phones = scraped_data.get("raw_phones", [])
+
+    # Get AI's values with safe defaults
+    result = {
+        "website_name":        str(ai_result.get("website_name", website_name) or website_name),
+        "company_name":        str(ai_result.get("company_name", "N/A") or "N/A"),
+        "address":             str(ai_result.get("address", "N/A") or "N/A"),
+        "mobile_number":       str(ai_result.get("mobile_number", "N/A") or "N/A"),
+        "mail":                ai_result.get("mail", []),
+        "core_service":        str(ai_result.get("core_service", "N/A") or "N/A"),
+        "target_customer":     str(ai_result.get("target_customer", "N/A") or "N/A"),
+        "probable_pain_point": str(ai_result.get("probable_pain_point", "N/A") or "N/A"),
+        "outreach_opener":     str(ai_result.get("outreach_opener", "N/A") or "N/A"),
+    }
+
+    # Ensure mail is a list
+    if isinstance(result["mail"], str):
+        if result["mail"].strip().lower() in ("n/a", "", "null", "none"):
+            result["mail"] = []
+        else:
+            result["mail"] = [e.strip() for e in result["mail"].split(",") if e.strip()]
+
+    # Merge regex-extracted emails if AI missed any
+    if emails:
+        existing_lower = {e.lower() for e in result["mail"]}
+        for email in emails:
+            if email.lower() not in existing_lower:
+                result["mail"].append(email)
+                existing_lower.add(email.lower())
+
+    # Use regex-extracted phone if AI returned N/A
+    if result["mobile_number"] in ("N/A", "", "null", "None") and phones:
+        result["mobile_number"] = phones[0]
+
+    return result
+
+
+def _fallback_profile(url: str, website_name: str, scraped_data: dict) -> dict:
+    """
+    Rule-based fallback when AI is unavailable or fails.
+    Uses regex-extracted contacts and basic text analysis.
+    """
+    emails = scraped_data.get("raw_emails", [])
+    phones = scraped_data.get("raw_phones", [])
+    pages = scraped_data.get("pages", {})
+
+    # Try to extract some info from homepage text
+    homepage_text = pages.get("homepage", "")
+    core_service = "N/A"
+    if homepage_text:
+        # Use first meaningful sentence as a rough service description
+        sentences = [s.strip() for s in homepage_text.split(". ") if len(s.strip()) > 20]
+        if sentences:
+            core_service = sentences[0][:200]
+
+    return {
+        "website_name":        website_name,
+        "company_name":        website_name,
+        "address":             "N/A",
+        "mobile_number":       phones[0] if phones else "N/A",
+        "mail":                emails,
+        "core_service":        core_service,
+        "target_customer":     "N/A",
+        "probable_pain_point": "N/A",
+        "outreach_opener":     f"Hi team at {website_name}, I came across your website and would love to connect about potential collaboration opportunities.",
+    }

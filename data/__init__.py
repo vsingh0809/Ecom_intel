@@ -1,4 +1,4 @@
-from data.models import RawBook, EnrichedBook
-from data.database import init_db, upsert_books, load_all_books
+from data.models import CompanyProfile
+from data.database import init_db, upsert_company, load_all_companies, get_company_by_url
 
-__all__ = ["RawBook", "EnrichedBook", "init_db", "upsert_books", "load_all_books"]
+__all__ = ["CompanyProfile", "init_db", "upsert_company", "load_all_companies", "get_company_by_url"]

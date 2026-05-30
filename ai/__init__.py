@@ -1,3 +1,3 @@
-from ai.enricher import enrich_books
+from ai.enricher import enrich_company, enrich_companies_batch
 
-__all__ = ["enrich_books"]
+__all__ = ["enrich_company", "enrich_companies_batch"]

@@ -1,3 +1,3 @@
-from scraper.scraper import scrape_books
+from scraper.scraper import scrape_company
 
-__all__ = ["scrape_books"]
+__all__ = ["scrape_company"]

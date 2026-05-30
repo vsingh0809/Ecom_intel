@@ -1,175 +1,105 @@
-# 📚 E-Commerce Intelligence Dashboard
+# 🏢 Company Intelligence System
 
-> Scrape → AI Enrich → Store → Visualise → Deploy
+AI-powered company website intelligence system that scrapes company websites, extracts business insights using Groq AI, and displays results through a premium web interface.
 
-An end-to-end production pipeline that scrapes book data from
-[books.toscrape.com](https://books.toscrape.com), enriches each book with
-Gemini AI (genre, summary, sentiment, value score), stores results in SQLite,
-and surfaces insights in a live Streamlit dashboard.
+## 🚀 Quick Start
 
----
+### Prerequisites
+- Python 3.11+
+- Groq API key (free at [console.groq.com](https://console.groq.com))
 
-## Architecture
-
-```
-pipeline.py
-    │
-    ├── scraper/scraper.py      HTTP fetch + BeautifulSoup parse
-    │       └── tenacity retry, respectful delay, Pydantic RawBook
-    │
-    ├── ai/enricher.py          Gemini batch enrichment (5 books/call)
-    │       └── fallback rule-based enrichment on failure
-    │
-    └── data/
-            ├── models.py       Pydantic contracts: RawBook, EnrichedBook
-            └── database.py     SQLAlchemy ORM — upsert, load, stats
-
-dashboard/app.py                Streamlit UI — charts, filters, pipeline runner
-```
-
----
-
-## Quick Start
-
-### 1. Clone & create virtual environment
-
+### Local Setup
 ```bash
-git clone <your-repo>
+# 1. Clone and enter project
 cd ecom_intel
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-```
 
-### 2. Install dependencies
+# 2. Create virtual environment
+python -m venv .venv
+.venv\Scripts\activate  # Windows
+# source .venv/bin/activate  # Linux/Mac
 
-```bash
+# 3. Install dependencies
 pip install -r requirements.txt
+
+# 4. Configure environment
+# Edit .env and add your GROQ_API_KEY
+
+# 5. Run the server
+python server.py
+
+# 6. Open browser
+# http://localhost:8000
 ```
 
-### 3. Configure environment
+## 📡 API Endpoints
 
-```bash
-cp .env.example .env
-# Open .env and add your GEMINI_API_KEY
-# Get one free at: https://aistudio.google.com
+### POST `/enrich`
+Enrich a single company URL.
+```json
+{
+  "url": "https://example.com",
+  "website_name": "Example Corp"
+}
 ```
 
-### 4. Run the pipeline
+### GET `/results`
+Returns all enriched company profiles.
 
-```bash
-# Scrape 5 pages (~100 books) + AI enrichment
-python pipeline.py
+### GET `/health`
+Health check endpoint.
 
-# Scrape more pages
-python pipeline.py --pages 10
+## 🏗️ Architecture
 
-# Fast test (scraper only, no AI)
-python pipeline.py --skip-ai
+```
+URL Input → Smart Scraper → HTML Cleaner → Groq AI → SQLite DB → Web UI
 ```
 
-### 5. Launch the dashboard
+### Smart Scraping (3-tier fallback)
+1. **Sitemap Discovery**: Check robots.txt → sitemap.xml → fuzzy-match relevant pages
+2. **Homepage Link Crawling**: Extract internal links, score by keyword relevance
+3. **Homepage Fallback**: Scrape homepage only if discovery fails
 
-```bash
-streamlit run dashboard/app.py
-```
+### Token Optimization
+- Strip scripts, styles, nav, footer, cookie banners
+- Collapse whitespace
+- Limit to ~4000 chars per page, max 5 pages
+- Total context to LLM: ~20K chars
 
-Open http://localhost:8501 — click **🚀 Run Pipeline** in the sidebar to
-trigger the pipeline directly from the UI.
+### Anti-Hallucination
+- Regex-extracted emails/phones passed as ground truth
+- AI instructed to use ONLY provided contacts
+- Missing fields return "N/A" — never fabricated
 
----
+## 🛠️ Tech Stack
+| Component | Technology |
+|-----------|-----------|
+| Backend | FastAPI + Uvicorn |
+| AI | Groq (llama-3.3-70b-versatile) |
+| Scraping | requests + BeautifulSoup |
+| Database | SQLite + SQLAlchemy |
+| Frontend | Vanilla HTML/CSS/JS |
+| Deployment | Render (free tier) |
 
-## Project Structure
-
+## 📁 Project Structure
 ```
 ecom_intel/
-├── config/
-│   ├── __init__.py
-│   └── settings.py         # Single source of truth for all config
-├── scraper/
-│   ├── __init__.py
-│   └── scraper.py          # Requests + BS4 with tenacity retry
-├── ai/
-│   ├── __init__.py
-│   └── enricher.py         # Gemini batch enrichment
-├── data/
-│   ├── __init__.py
-│   ├── models.py           # Pydantic data contracts
-│   └── database.py         # SQLAlchemy ORM layer
-├── dashboard/
-│   └── app.py              # Streamlit dashboard
-├── logs/
-│   └── .gitkeep
-├── pipeline.py             # Main orchestrator
-├── requirements.txt        # Pinned dependencies
-├── .env.example            # Config template
-├── .gitignore
-├── Procfile                # Railway deployment
-└── runtime.txt             # Python 3.11.9
+├── config/          # Settings & env management
+├── scraper/         # Smart 3-tier company scraper
+├── ai/              # Groq AI enrichment engine
+├── data/            # Pydantic models + SQLite ORM
+├── static/          # Premium glassmorphic frontend
+├── server.py        # FastAPI application
+├── pipeline.py      # Orchestrator
+├── colab_notebook.py # Google Colab reference
+└── requirements.txt # Dependencies
 ```
 
----
+## 🚀 Deployment (Render)
+1. Push to GitHub
+2. Create new Web Service on Render
+3. Set environment variable: `GROQ_API_KEY`
+4. Build command: `pip install -r requirements.txt`
+5. Start command: `uvicorn server:app --host 0.0.0.0 --port $PORT`
 
-## Configuration
-
-| Variable | Default | Description |
-|---|---|---|
-| `GEMINI_API_KEY` | **required** | Free at aistudio.google.com |
-| `MAX_PAGES` | `5` | Pages to scrape (20 books each) |
-| `REQUEST_DELAY` | `1.5` | Seconds between page fetches |
-| `AI_BATCH_SIZE` | `5` | Books per Gemini call |
-| `AI_BATCH_DELAY` | `4.5` | Seconds between Gemini batches |
-| `LOG_LEVEL` | `INFO` | `DEBUG` for verbose output |
-
----
-
-## Deployment (Railway)
-
-```bash
-# Install CLI
-npm install -g @railway/cli
-
-# Login and initialise
-railway login
-railway init
-
-# Deploy
-railway up
-
-# Set environment variables on Railway dashboard
-# (copy contents of your .env)
-```
-
-The `Procfile` is pre-configured:
-```
-web: streamlit run dashboard/app.py --server.port $PORT --server.address 0.0.0.0
-```
-
----
-
-## Production Practices Used
-
-| Practice | Implementation |
-|---|---|
-| Typed data contracts | Pydantic `RawBook` / `EnrichedBook` models |
-| Retry with backoff | `tenacity` on HTTP fetches and Gemini calls |
-| Fail-fast config | `settings.validate()` before any work starts |
-| Safe upserts | URL as primary key — re-runs never duplicate data |
-| Graceful degradation | Rule-based fallback when AI call fails |
-| Structured logging | `loguru` → console + rotating file in `logs/` |
-| Separation of concerns | Scraper / AI / Data / Dashboard are fully decoupled |
-| Rate limit respect | `AI_BATCH_DELAY` honours Gemini free-tier (15 RPM) |
-| No secrets in code | All keys via `.env` — `.env` in `.gitignore` |
-| Idempotent DB | `init_db()` is safe to call on every startup |
-
----
-
-## Adapting for Hackathon Day
-
-When you see the actual problem, only these files need editing:
-
-1. **`scraper/scraper.py`** → update `_parse_page()` for the target site
-2. **`ai/enricher.py`** → adjust `GENRES` list and prompt schema
-3. **`pipeline.py`** → tweak stage logic if needed
-4. **`dashboard/app.py`** → add/remove charts to match the data shape
-
-Everything else (retry, DB, logging, deployment) just works.
+## 📄 License
+MIT

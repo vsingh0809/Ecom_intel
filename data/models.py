@@ -1,14 +1,14 @@
 """
 data/models.py
 --------------
-Pydantic models act as typed contracts between pipeline stages.
-  RawBook     → what the scraper produces
-  EnrichedBook → what the AI enricher produces
+Pydantic models as typed contracts for the company intelligence pipeline.
+
+CompanyProfile: validated output schema matching hackathon requirements exactly.
 
 Using Pydantic gives us:
-  • Automatic type coercion (string "4.5" → float 4.5)
-  • Validation errors with clear messages
-  • Serialisation to dict/json for DB persistence
+  • Automatic type coercion and validation
+  • Serialisation to dict/json for DB and API responses
+  • Schema stability — missing fields default to safe values ("N/A", [])
 """
 
 from datetime import datetime
@@ -16,60 +16,69 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 
 
-class RawBook(BaseModel):
+class CompanyProfile(BaseModel):
     """
-    Data contract for a scraped book.
-    Every field here must be filled by the scraper — no AI guesses.
+    Enriched company profile — matches the hackathon output schema exactly.
+    
+    Schema stability: every field has a safe default so the JSON structure
+    NEVER breaks, even if scraping or AI extraction fails partially.
     """
-    title:        str
-    price:        float          # in GBP (£)
-    rating:       int            # 1–5 stars
-    availability: str
-    url:          str
-    scraped_at:   datetime = Field(default_factory=datetime.utcnow)
+    website_url:          str
+    website_name:         str  = "N/A"
+    company_name:         str  = "N/A"
+    address:              str  = "N/A"
+    mobile_number:        str  = "N/A"
+    mail:                 list[str] = Field(default_factory=list)
+    core_service:         str  = "N/A"
+    target_customer:      str  = "N/A"
+    probable_pain_point:  str  = "N/A"
+    outreach_opener:      str  = "N/A"
+    enriched_at:          Optional[datetime] = None
 
-    @field_validator("rating")
+    @field_validator("mail", mode="before")
     @classmethod
-    def rating_in_range(cls, v: int) -> int:
-        if not (1 <= v <= 5):
-            raise ValueError(f"Rating must be 1–5, got {v}")
-        return v
+    def ensure_mail_is_list(cls, v):
+        """Handle edge cases: AI might return a string instead of list."""
+        if isinstance(v, str):
+            if v.strip() in ("", "N/A", "n/a", "null", "None"):
+                return []
+            # Could be comma-separated
+            return [e.strip() for e in v.split(",") if e.strip()]
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(e).strip() for e in v if str(e).strip() and str(e).strip().lower() not in ("n/a", "null", "none")]
+        return []
 
-    @field_validator("price")
+    @field_validator("website_url")
     @classmethod
-    def price_non_negative(cls, v: float) -> float:
-        if v < 0:
-            raise ValueError(f"Price cannot be negative, got {v}")
-        return round(v, 2)
+    def normalize_url(cls, v: str) -> str:
+        """Ensure URL has a scheme."""
+        v = v.strip()
+        if not v.startswith(("http://", "https://")):
+            v = "https://" + v
+        return v.rstrip("/")
 
+    def to_hackathon_dict(self) -> dict:
+        """
+        Return the exact JSON format the hackathon expects.
+        This is the schema judges will validate against.
+        """
+        return {
+            "website_name":        self.website_name,
+            "company_name":        self.company_name,
+            "address":             self.address,
+            "mobile_number":       self.mobile_number,
+            "mail":                self.mail if self.mail else [],
+            "core_service":        self.core_service,
+            "target_customer":     self.target_customer,
+            "probable_pain_point": self.probable_pain_point,
+            "outreach_opener":     self.outreach_opener,
+        }
 
-class EnrichedBook(RawBook):
-    """
-    Extends RawBook with AI-generated fields.
-    All AI fields have safe defaults so a DB record is always valid
-    even if enrichment partially failed.
-    """
-    genre:        str   = "Unknown"
-    summary:      str   = ""
-    sentiment:    str   = "Neutral"     # Positive | Neutral | Negative
-    value_score:  float = 0.0           # 0.0–10.0 computed by AI
-    enriched_at:  Optional[datetime] = None
-
-    @field_validator("value_score")
-    @classmethod
-    def clamp_value_score(cls, v: float) -> float:
-        return round(max(0.0, min(10.0, v)), 2)
-
-    @field_validator("sentiment")
-    @classmethod
-    def valid_sentiment(cls, v: str) -> str:
-        allowed = {"Positive", "Neutral", "Negative"}
-        return v if v in allowed else "Neutral"
-
-    def value_label(self) -> str:
-        """Human-readable value tier. Used in dashboard."""
-        if self.value_score >= 7.0:
-            return "Great Deal"
-        elif self.value_score >= 4.0:
-            return "Fair"
-        return "Overpriced"
+    def to_full_dict(self) -> dict:
+        """Full dict including metadata, for API responses."""
+        d = self.to_hackathon_dict()
+        d["website_url"] = self.website_url
+        d["enriched_at"] = self.enriched_at.isoformat() if self.enriched_at else None
+        return d

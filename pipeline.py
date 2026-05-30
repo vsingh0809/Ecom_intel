@@ -2,38 +2,36 @@
 pipeline.py
 -----------
 Orchestrator: scrape → AI enrich → persist.
-This is the only file you need to run to populate the database.
+
+Reusable from both the FastAPI server and the Colab notebook.
+Each function is isolated — a scraper failure doesn't crash AI results.
 
 Usage:
-    python pipeline.py                  # 5 pages, full AI enrichment
-    python pipeline.py --pages 10       # scrape 10 pages (~200 books)
-    python pipeline.py --skip-ai        # scrape only, skip Gemini (fast test)
+    # Single company (web API)
+    result = enrich_single("https://example.com", "Example Corp")
 
-Production design:
-    • validate() called before any work starts (fail-fast)
-    • Each stage is isolated — a scraper failure doesn't lose AI results
-    • Structured JSON logging to logs/pipeline.log for debugging
-    • Exit code 1 on fatal errors (for CI/monitoring systems)
+    # Batch companies (Colab notebook)
+    results = enrich_batch(["https://a.com", "https://b.com"])
 """
 
-import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from loguru import logger
 
 from config import settings
-from scraper import scrape_books
-from ai import enrich_books
-from data import init_db, upsert_books, load_all_books
+from scraper import scrape_company
+from ai import enrich_company, enrich_companies_batch
+from data import init_db, upsert_company, CompanyProfile
 
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 
-def _configure_logging() -> None:
-    settings.bootstrap()  # ensure logs/ directory exists
+def configure_logging() -> None:
+    settings.bootstrap()
 
-    logger.remove()  # remove default handler
+    logger.remove()
 
     # Console: coloured, human-readable
     logger.add(
@@ -54,88 +52,147 @@ def _configure_logging() -> None:
         rotation="10 MB",
         retention="7 days",
         format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {module}.{function} | {message}",
-        enqueue=True,       # non-blocking writes
+        enqueue=True,
     )
 
 
-# ── Pipeline stages ───────────────────────────────────────────────────────────
+# ── Single Company Pipeline ──────────────────────────────────────────────────
 
-def _stage_scrape(pages: int) -> list:
-    logger.info("━━━ Stage 1: Scraping ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    books = scrape_books(max_pages=pages)
-    if not books:
-        logger.critical("[pipeline] Scraper returned 0 books — aborting")
-        sys.exit(1)
-    return books
+def enrich_single(url: str, website_name: str = "N/A") -> dict:
+    """
+    Full pipeline for a single company: scrape → AI enrich → persist.
 
+    Returns the enriched company profile dict (hackathon format + metadata).
+    Never raises — returns a safe fallback dict on any failure.
+    """
+    logger.info(f"[pipeline] Starting enrichment for: {url}")
 
-def _stage_enrich(raw_books: list, skip_ai: bool) -> list:
-    if skip_ai:
-        logger.warning("[pipeline] --skip-ai set: using raw books without enrichment")
-        return raw_books
-
-    logger.info("━━━ Stage 2: AI Enrichment ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    return enrich_books(raw_books)
-
-
-def _stage_persist(books: list) -> None:
-    logger.info("━━━ Stage 3: Persisting ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    records = [b.model_dump() for b in books]
-    stats   = upsert_books(records)
-    logger.info(f"[pipeline] DB write: {stats}")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def run(pages: int, skip_ai: bool) -> None:
-    _configure_logging()
-
-    logger.info(
-        f"╔══════════════════════════════════════════════════╗\n"
-        f"║   E-Commerce Intelligence Pipeline              ║\n"
-        f"║   pages={pages:<4}  skip_ai={str(skip_ai):<5}                   ║\n"
-        f"╚══════════════════════════════════════════════════╝"
-    )
-
-    # Fail fast on missing config
-    if not skip_ai:
-        try:
-            settings.validate()
-        except EnvironmentError as exc:
-            logger.critical(str(exc))
-            sys.exit(1)
-
-    # Initialise DB schema
+    # Ensure DB is ready
     init_db()
 
-    # Run all three stages
-    raw_books = _stage_scrape(pages)
-    books     = _stage_enrich(raw_books, skip_ai)
-    _stage_persist(books)
+    # Stage 1: Scrape
+    logger.info("[pipeline] ━━━ Stage 1: Scraping ━━━")
+    scraped = scrape_company(url)
 
-    # Final summary
-    total = len(load_all_books())
-    logger.success(
-        f"\n✅ Pipeline finished — {total} total books in database\n"
-        f"   Next: streamlit run dashboard/app.py"
-    )
+    if not scraped.get("success"):
+        logger.warning(f"[pipeline] Scraping failed for {url}: {scraped.get('error')}")
+
+    # Stage 2: AI Enrichment
+    logger.info("[pipeline] ━━━ Stage 2: AI Enrichment ━━━")
+    enriched = enrich_company(scraped, website_name)
+
+    # Stage 3: Validate & Persist
+    logger.info("[pipeline] ━━━ Stage 3: Persisting ━━━")
+    try:
+        profile = CompanyProfile(
+            website_url=url,
+            enriched_at=datetime.utcnow(),
+            **enriched,
+        )
+        profile_dict = profile.to_full_dict()
+        upsert_company(profile_dict)
+    except Exception as exc:
+        logger.error(f"[pipeline] Validation/persist error: {exc}")
+        # Still return the enriched data even if persistence fails
+        enriched["website_url"] = url
+        enriched["enriched_at"] = datetime.utcnow().isoformat()
+        return enriched
+
+    logger.success(f"[pipeline] ✅ Enrichment complete for: {enriched.get('company_name', url)}")
+    return profile_dict
+
+
+# ── Batch Pipeline (for Colab) ────────────────────────────────────────────────
+
+def enrich_batch(urls: list[str]) -> list[dict]:
+    """
+    Batch pipeline for multiple companies.
+    Scrapes all URLs first, then batch-enriches with AI, then persists.
+
+    Returns list of enriched profile dicts in hackathon format.
+    """
+    if not urls:
+        return []
+
+    logger.info(f"[pipeline] Batch enrichment for {len(urls)} URLs")
+
+    # Ensure DB is ready
+    init_db()
+
+    # Stage 1: Scrape all
+    logger.info("[pipeline] ━━━ Stage 1: Scraping All ━━━")
+    scraped_list = []
+    website_names = []
+    for i, url in enumerate(urls):
+        logger.info(f"[pipeline] Scraping {i+1}/{len(urls)}: {url}")
+        scraped = scrape_company(url)
+        scraped_list.append(scraped)
+        # Derive website name from domain
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        domain = parsed.netloc.replace("www.", "")
+        name = domain.split(".")[0].replace("-", " ").title()
+        website_names.append(name)
+
+    # Stage 2: AI Enrichment (batch)
+    logger.info("[pipeline] ━━━ Stage 2: Batch AI Enrichment ━━━")
+    enriched_list = enrich_companies_batch(scraped_list, website_names)
+
+    # Stage 3: Validate & Persist all
+    logger.info("[pipeline] ━━━ Stage 3: Persisting All ━━━")
+    results = []
+    for url, enriched in zip(urls, enriched_list):
+        try:
+            profile = CompanyProfile(
+                website_url=url,
+                enriched_at=datetime.utcnow(),
+                **enriched,
+            )
+            hackathon_dict = profile.to_hackathon_dict()
+            full_dict = profile.to_full_dict()
+            upsert_company(full_dict)
+            results.append(hackathon_dict)
+        except Exception as exc:
+            logger.error(f"[pipeline] Error persisting {url}: {exc}")
+            results.append(enriched)
+
+    logger.success(f"[pipeline] ✅ Batch complete — {len(results)} companies enriched")
+    return results
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="E-Commerce Intelligence Pipeline",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "--pages",
-        type=int,
-        default=settings.MAX_PAGES,
-        help="Number of catalogue pages to scrape (20 books per page)",
-    )
-    parser.add_argument(
-        "--skip-ai",
-        action="store_true",
-        help="Skip Gemini enrichment — useful for testing the scraper alone",
-    )
-    args = parser.parse_args()
-    run(pages=args.pages, skip_ai=args.skip_ai)
+    configure_logging()
+
+    # Interactive mode: ask for URLs
+    print("=" * 60)
+    print("  Company Intelligence Pipeline")
+    print("=" * 60)
+
+    raw_input = input("\nEnter company URLs (JSON array or comma-separated):\n> ").strip()
+
+    # Parse input
+    import json
+    try:
+        urls = json.loads(raw_input)
+    except json.JSONDecodeError:
+        urls = [u.strip() for u in raw_input.split(",") if u.strip()]
+
+    if not urls:
+        print("No URLs provided. Exiting.")
+        sys.exit(1)
+
+    print(f"\nProcessing {len(urls)} URLs...")
+    results = enrich_batch(urls)
+
+    # Output as formatted JSON
+    output = json.dumps(results, indent=2, ensure_ascii=False)
+    print("\n" + "=" * 60)
+    print("RESULTS:")
+    print("=" * 60)
+    print(output)
+
+    # Save to file
+    output_path = settings.DATA_DIR / "results.json"
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(output)
+    print(f"\n✅ Results saved to: {output_path}")
