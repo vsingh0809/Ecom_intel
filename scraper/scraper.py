@@ -244,7 +244,7 @@ def _extract_phones(html: str) -> list[str]:
         phone = match.group().strip()
         # Must have at least 7 digits to be a real phone number
         digits = re.sub(r'\D', '', phone)
-        if len(digits) >= 7:
+        if len(digits) >= 10:
             phones.add(phone)
     return sorted(phones)
 
