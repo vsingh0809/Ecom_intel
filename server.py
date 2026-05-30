@@ -1,20 +1,4 @@
-"""
-server.py
----------
-FastAPI application serving the Company Intelligence System.
 
-Endpoints:
-  POST /enrich  — Enrich a single company URL
-  GET  /results — Return all enriched companies
-  GET  /        — Serve the frontend
-
-Production practices:
-  • CORS enabled for all origins (hackathon requirement: publicly accessible)
-  • Structured error responses — never returns unhandled 500s
-  • Background-compatible: long enrichment runs don't block other requests
-  • Schema-stable responses: always returns valid JSON matching hackathon format
-  • Static file serving: frontend served from /static/
-"""
 
 import sys
 from pathlib import Path
@@ -28,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from loguru import logger
+import json
 
 from config import settings
 from pipeline import enrich_single, configure_logging
@@ -51,6 +36,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+BASE_DIR = Path(__file__).resolve().parent
+RESULTS_FILE = BASE_DIR / "results.json"
+
+def init_db():
+    """Initialize the database (creates an empty results.json if it doesn't exist)."""
+    if not RESULTS_FILE.exists():
+        logger.info(f"[data] Creating new database file at {RESULTS_FILE}")
+        with open(RESULTS_FILE, "w", encoding="utf-8") as f:
+            json.dump([], f)
+    else:
+        logger.info(f"[data] Database found at {RESULTS_FILE}")
+
+def load_all_companies():
+    """Reads results.json and returns the list of enriched companies."""
+    if not RESULTS_FILE.exists():
+        logger.warning(f"[data] No results file found at {RESULTS_FILE}")
+        return []
+
+    try:
+        with open(RESULTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # Guarantee we always return a list for the frontend
+            return data if isinstance(data, list) else []
+            
+    except json.JSONDecodeError:
+        logger.error("[data] results.json is empty or corrupted.")
+        return []
+    except Exception as e:
+        logger.error(f"[data] Error reading results.json: {e}")
+        return []
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 

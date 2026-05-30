@@ -188,7 +188,7 @@ def _clean_html(html: str, max_chars: int = None) -> str:
             tag.decompose()
 
     # Remove nav, footer, header (common boilerplate)
-    for tag_name in ["nav", "footer", "header"]:
+    for tag_name in ["nav", "header"]:
         for tag in soup.find_all(tag_name):
             tag.decompose()
 
