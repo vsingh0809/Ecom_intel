@@ -39,7 +39,10 @@ app.add_middleware(
 BASE_DIR = Path(__file__).resolve().parent
 RESULTS_FILE = BASE_DIR / "results.json"
 
-def init_db():
+BASE_DIR = Path(__file__).resolve().parent.parent
+RESULTS_FILE = BASE_DIR / "results.json"
+
+def init_db() -> None:
     """Initialize the database (creates an empty results.json if it doesn't exist)."""
     if not RESULTS_FILE.exists():
         logger.info(f"[data] Creating new database file at {RESULTS_FILE}")
@@ -48,8 +51,8 @@ def init_db():
     else:
         logger.info(f"[data] Database found at {RESULTS_FILE}")
 
-def load_all_companies():
-    """Reads results.json and returns the list of enriched companies."""
+def load_all_companies() -> list:
+    """Reads results.json and returns the list of enriched companies for the API."""
     if not RESULTS_FILE.exists():
         logger.warning(f"[data] No results file found at {RESULTS_FILE}")
         return []
@@ -57,7 +60,7 @@ def load_all_companies():
     try:
         with open(RESULTS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # Guarantee we always return a list for the frontend
+            # Ensure we always return a list for the API response
             return data if isinstance(data, list) else []
             
     except json.JSONDecodeError:
