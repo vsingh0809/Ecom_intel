@@ -41,6 +41,7 @@ CRITICAL RULES — READ CAREFULLY:
 5. The "target_customer" should be inferred from case studies, testimonials, or service descriptions on the site.
 6. The "probable_pain_point" should be inferred from the problems the company claims to solve for its customers.
 7. The "outreach_opener" must reference SPECIFIC details from the website content — never use generic templates.
+8. "address" = look specifically for physical locations, HQ, or street addresses, often found near the contact info.
 
 You must respond with ONLY a valid JSON object. No explanation. No markdown. No code fences. Raw JSON only."""
 

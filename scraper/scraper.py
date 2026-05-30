@@ -122,11 +122,10 @@ EMAIL_PATTERN = re.compile(
     r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Z|a-z]{2,}\b'
 )
 PHONE_PATTERN = re.compile(
-    r'(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}'  
-    r'|(?:\+?1)?[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'      
-    r'|\+\d{1,3}[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9}'      
-    r'|\d{3}[-.\s]?\d{4}'                                        
-    )
+    r'(?:\+?91[-.\s]?)?(?:0)?(?:[6-9]\d{9})'                            # Indian Mobiles (e.g., +91 9876543210)
+    r'|(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}'        # US/North American
+    r'|\+\d{1,3}[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9}'            # Generic International
+)
 
 
 # ── HTTP Layer ────────────────────────────────────────────────────────────────
@@ -242,7 +241,7 @@ def _extract_phones(html: str) -> list[str]:
     phones = set()
     for match in PHONE_PATTERN.finditer(html):
         phone = match.group().strip()
-        # Must have at least 7 digits to be a real phone number
+        # Must have at least 10 digits to be a real phone number
         digits = re.sub(r'\D', '', phone)
         if len(digits) >= 10:
             phones.add(phone)
