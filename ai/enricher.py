@@ -71,7 +71,7 @@ Return a JSON object with exactly these fields:
 }}"""
 
 
-# ── Groq Client ──────────────────────────────────────────────────────────────
+# ── Groq Client ──────────────────────────────────────────────────────────────────
 
 _client: Optional[Groq] = None
 
@@ -137,7 +137,7 @@ def _call_groq(system_prompt: str, user_prompt: str) -> dict:
     return parsed
 
 
-# ── Batch Processing ──────────────────────────────────────────────────────────
+# ── Batch Processing ──────────────────────────────────────────────────────────────
 
 BATCH_SYSTEM_PROMPT = """You are a business intelligence analyst. Extract structured company information from website content for MULTIPLE companies.
 
@@ -202,7 +202,7 @@ WEBSITE CONTENT ({len(pages)} pages scraped):
 --- END COMPANY {index} ---"""
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── Public API ────────────────────────────────────────────────────────────────────
 
 def enrich_company(scraped_data: dict, website_name: str = "N/A") -> dict:
     """
@@ -226,6 +226,13 @@ def enrich_company(scraped_data: dict, website_name: str = "N/A") -> dict:
     pages = scraped_data["pages"]
     emails = scraped_data.get("raw_emails", [])
     phones = scraped_data.get("raw_phones", [])
+
+    # ── DEBUG: Log what scraper found ──────────────────────────────────────────
+    logger.debug(f"[ai] Scraper found for {url}:")
+    logger.debug(f"[ai]   Pages: {list(pages.keys())}")
+    logger.debug(f"[ai]   Total chars: {sum(len(t) for t in pages.values())}")
+    logger.debug(f"[ai]   Raw emails: {emails}")
+    logger.debug(f"[ai]   Raw phones: {phones}")
 
     content_parts = []
     for page_name, text in pages.items():
@@ -331,7 +338,7 @@ def enrich_companies_batch(
     ]
 
 
-# ── Validation & Fallback ────────────────────────────────────────────────────
+# ── Validation & Fallback ────────────────────────────────────────────────────────
 
 def _validate_result(
     ai_result: dict,
@@ -378,6 +385,14 @@ def _validate_result(
     if result["mobile_number"] in ("N/A", "", "null", "None") and phones:
         result["mobile_number"] = phones[0]
 
+    # ── DEBUG: Log final result ────────────────────────────────────────────────
+    logger.debug(f"[ai] Final validated result for {url}:")
+    logger.debug(f"[ai]   mail: {result['mail']}")
+    logger.debug(f"[ai]   mobile_number: {result['mobile_number']}")
+    logger.debug(f"[ai]   address: {result['address']}")
+    logger.debug(f"[ai]   target_customer: {result['target_customer']}")
+    logger.debug(f"[ai]   probable_pain_point: {result['probable_pain_point']}")
+
     return result
 
 
@@ -399,6 +414,7 @@ def _fallback_profile(url: str, website_name: str, scraped_data: dict) -> dict:
         if sentences:
             core_service = sentences[0][:200]
 
+    logger.warning(f"[ai] Using fallback profile for {url}")
     return {
         "website_name":        website_name,
         "company_name":        website_name,
