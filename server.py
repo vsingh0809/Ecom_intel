@@ -19,7 +19,7 @@ from pipeline import enrich_single, configure_logging
 from data import init_db, load_all_companies
 
 
-# ── App Setup ─────────────────────────────────────────────────────────────────
+# ── App Setup ──────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title=settings.APP_TITLE,
@@ -37,40 +37,10 @@ app.add_middleware(
 )
 
 BASE_DIR = Path(__file__).resolve().parent
-RESULTS_FILE = BASE_DIR / "results.json"
+STATIC_DIR = BASE_DIR / "static"
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-RESULTS_FILE = BASE_DIR / "results.json"
 
-def init_db() -> None:
-    """Initialize the database (creates an empty results.json if it doesn't exist)."""
-    if not RESULTS_FILE.exists():
-        logger.info(f"[data] Creating new database file at {RESULTS_FILE}")
-        with open(RESULTS_FILE, "w", encoding="utf-8") as f:
-            json.dump([], f)
-    else:
-        logger.info(f"[data] Database found at {RESULTS_FILE}")
-
-def load_all_companies() -> list:
-    """Reads results.json and returns the list of enriched companies for the API."""
-    if not RESULTS_FILE.exists():
-        logger.warning(f"[data] No results file found at {RESULTS_FILE}")
-        return []
-
-    try:
-        with open(RESULTS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            # Ensure we always return a list for the API response
-            return data if isinstance(data, list) else []
-            
-    except json.JSONDecodeError:
-        logger.error("[data] results.json is empty or corrupted.")
-        return []
-    except Exception as e:
-        logger.error(f"[data] Error reading results.json: {e}")
-        return []
-
-# ── Startup ───────────────────────────────────────────────────────────────────
+# ── Startup ────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup():
@@ -81,7 +51,7 @@ async def startup():
     logger.info(f"[server] {settings.APP_TITLE} started on port {settings.PORT}")
 
 
-# ── Request/Response Models ──────────────────────────────────────────────────
+# ── Request/Response Models ────────────────────────────────────────────────────
 
 class EnrichRequest(BaseModel):
     """Request body for POST /enrich."""
@@ -107,7 +77,7 @@ class EnrichResponse(BaseModel):
     enriched_at: str = None
 
 
-# ── API Endpoints ─────────────────────────────────────────────────────────────
+# ── API Endpoints ──────────────────────────────────────────────────────────────
 
 @app.post("/enrich", response_model=EnrichResponse)
 async def enrich_company_endpoint(request: EnrichRequest):
@@ -130,9 +100,10 @@ async def enrich_company_endpoint(request: EnrichRequest):
 
     try:
         result = enrich_single(url, website_name)
+        logger.info(f"[api] Enrichment successful: {result}")
         return JSONResponse(content=result, status_code=200)
     except Exception as exc:
-        logger.error(f"[api] Enrichment error: {exc}")
+        logger.error(f"[api] Enrichment error: {exc}", exc_info=True)
         # Return a safe fallback response instead of crashing
         return JSONResponse(
             content={
@@ -158,28 +129,29 @@ async def get_results():
     """
     GET /results
     Returns: Array of all enriched company profiles.
+    Fetches from the SQLite database, not from a JSON file.
     """
     logger.info("[api] GET /results")
     try:
         companies = load_all_companies()
+        logger.info(f"[api] Loaded {len(companies)} companies from database")
         return JSONResponse(content=companies, status_code=200)
     except Exception as exc:
-        logger.error(f"[api] Error loading results: {exc}")
+        logger.error(f"[api] Error loading results: {exc}", exc_info=True)
         return JSONResponse(content=[], status_code=200)
 
 
-# ── Static Files & Frontend ──────────────────────────────────────────────────
+# ── Static Files & Frontend ────────────────────────────────────────────────────
 
 # Mount static files
-static_dir = settings.STATIC_DIR
-if static_dir.exists():
-    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.get("/")
 async def serve_frontend():
     """Serve the main frontend page."""
-    index_path = static_dir / "index.html"
+    index_path = STATIC_DIR / "index.html"
     if index_path.exists():
         return FileResponse(str(index_path))
     return JSONResponse(
@@ -188,7 +160,7 @@ async def serve_frontend():
     )
 
 
-# ── Health Check ──────────────────────────────────────────────────────────────
+# ── Health Check ────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health_check():
@@ -196,7 +168,7 @@ async def health_check():
     return {"status": "healthy", "service": settings.APP_TITLE}
 
 
-# ── Run ───────────────────────────────────────────────────────────────────────
+# ── Run ────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
