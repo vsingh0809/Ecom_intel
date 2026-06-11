@@ -76,11 +76,36 @@ def init_db() -> None:
     logger.info("[db] Schema initialised")
 
 
+def _ensure_datetime(value: Any) -> datetime:
+    """
+    Convert value to datetime object.
+    Handles: datetime, ISO string (with or without Z), and None.
+    """
+    if isinstance(value, datetime):
+        return value
+    
+    if isinstance(value, str):
+        try:
+            # Handle ISO format with Z timezone
+            if value.endswith('Z'):
+                value = value[:-1] + '+00:00'
+            return datetime.fromisoformat(value)
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"[db] Failed to parse enriched_at '{value}': {e}")
+            return datetime.utcnow()
+    
+    # Default case (None, int, etc.)
+    return datetime.utcnow()
+
+
 def upsert_company(profile_dict: dict) -> dict[str, str]:
     """
     Insert or update a company profile.
     The 'mail' field is converted from list to JSON string for storage.
     Returns {"action": "inserted"} or {"action": "updated"}.
+    
+    CRITICAL: enriched_at must be a Python datetime object.
+    If passed as ISO string, it will be automatically parsed to datetime.
     """
     # Convert mail list to JSON string for SQLite storage
     data = dict(profile_dict)
@@ -91,7 +116,11 @@ def upsert_company(profile_dict: dict) -> dict[str, str]:
     valid_cols = {c.name for c in CompanyRecord.__table__.columns}
     clean = {k: v for k, v in data.items() if k in valid_cols}
 
-    if "enriched_at" not in clean or clean["enriched_at"] is None:
+    # ── CRITICAL FIX: Ensure enriched_at is a datetime object ──────────────────
+    # SQLite DateTime type only accepts Python datetime.datetime objects
+    if "enriched_at" in clean and clean["enriched_at"] is not None:
+        clean["enriched_at"] = _ensure_datetime(clean["enriched_at"])
+    else:
         clean["enriched_at"] = datetime.utcnow()
 
     with Session(get_engine()) as session:
